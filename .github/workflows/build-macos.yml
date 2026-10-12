@@ -94,7 +94,21 @@ jobs:
 
       - name: 构建发布二进制
         working-directory: ${{ runner.temp }}/qcclip-source
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        env:
+          GH_TOKEN: ${{ secrets.CI_READ_QCCLIP_PRIVATE }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
+          BUILD_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_log="$RUNNER_TEMP/build-${BUILD_TARGET}.log"
+          if ! cargo build --locked --release --target "$BUILD_TARGET" >"$build_log" 2>&1; then
+            gh release upload "$RELEASE_TAG" "$build_log" \
+              --repo "$PRIVATE_REPOSITORY" --clobber
+            echo "编译失败，详细日志已上传私有仓库 Release" >&2
+            exit 1
+          fi
+          echo "发布二进制编译完成"
 
       - name: 创建 macOS DMG
         env:
