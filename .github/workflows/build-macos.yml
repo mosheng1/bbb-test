@@ -167,3 +167,11 @@ jobs:
           gh release upload "$RELEASE_TAG" "$DMG_PATH" \
             --repo "$PRIVATE_REPOSITORY" \
             --clobber
+
+      - name: 清理临时源码
+        if: always()
+        env:
+          SOURCE_DIR: ${{ runner.temp }}/qcclip-source
+        shell: bash
+        run: rm -rf "$SOURCE_DIR"
+
