@@ -1,0 +1,169 @@
+name: macOS DMG 构建并发布
+
+on:
+  workflow_dispatch:
+    inputs:
+      private_ref:
+        description: 私有仓库中用于构建的分支、标签或提交
+        required: true
+        default: feat/macos-platform
+        type: string
+      release_tag:
+        description: 私有仓库 Release 标签，留空时自动使用 ci/macos-运行编号
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qcclip-macos-build
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPOSITORY: mosheng1/QcClip-private
+
+jobs:
+  prepare-release:
+    name: 创建私有仓库 Release
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: 创建预发布 Release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.CI_READ_QCCLIP_PRIVATE }}
+          PRIVATE_REF: ${{ inputs.private_ref }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="${REQUESTED_TAG:-ci/macos-${RUN_ID}}"
+          if [[ ! "$release_tag" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "Release 标签包含不支持的字符" >&2
+            exit 1
+          fi
+          release_notes=$(printf '源码仓库：%s\n构建 ref：%s\n公开仓库工作流：%s' \
+            "$PRIVATE_REPOSITORY" "$PRIVATE_REF" "$WORKFLOW_URL")
+          gh release create "$release_tag" \
+            --repo "$PRIVATE_REPOSITORY" \
+            --target "$PRIVATE_REF" \
+            --title "QcClip macOS 构建 #${RUN_NUMBER}" \
+            --notes "$release_notes" \
+            --prerelease
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: 构建 ${{ matrix.arch }} DMG
+    needs: prepare-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+            target: x86_64-apple-darwin
+          - os: macos-15
+            arch: aarch64
+            target: aarch64-apple-darwin
+    steps:
+      - name: 拉取私有仓库源码
+        env:
+          GH_TOKEN: ${{ secrets.CI_READ_QCCLIP_PRIVATE }}
+          PRIVATE_REF: ${{ inputs.private_ref }}
+          SOURCE_DIR: ${{ runner.temp }}/qcclip-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_url="https://x-access-token:${GH_TOKEN}@github.com/${PRIVATE_REPOSITORY}.git"
+          git init "$SOURCE_DIR"
+          git -C "$SOURCE_DIR" remote add origin "$source_url"
+          git -C "$SOURCE_DIR" fetch --depth=1 origin "$PRIVATE_REF"
+          git -C "$SOURCE_DIR" checkout --detach FETCH_HEAD
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 构建发布二进制
+        working-directory: ${{ runner.temp }}/qcclip-source
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: 创建 macOS DMG
+        env:
+          TARGET: ${{ matrix.target }}
+          SOURCE_DIR: ${{ runner.temp }}/qcclip-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_root="$RUNNER_TEMP/QcClip.app"
+          contents="$app_root/Contents"
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$SOURCE_DIR/Cargo.toml" | head -n 1)"
+          binary="$SOURCE_DIR/target/$TARGET/release/QcClip"
+          test -n "$version"
+          test -x "$binary"
+
+          rm -rf "$app_root"
+          mkdir -p "$contents/MacOS" "$contents/Resources"
+          cp "$binary" "$contents/MacOS/QcClip"
+          chmod +x "$contents/MacOS/QcClip"
+
+          iconset="$RUNNER_TEMP/QcClip.iconset"
+          rm -rf "$iconset"
+          mkdir -p "$iconset"
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" "$SOURCE_DIR/assets/icon1024.png" \
+              --out "$iconset/icon_${size}x${size}.png" >/dev/null
+            double=$((size * 2))
+            sips -z "$double" "$double" "$SOURCE_DIR/assets/icon1024.png" \
+              --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$iconset" -o "$contents/Resources/QcClip.icns"
+
+          cat > "$contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleDisplayName</key><string>QcClip</string>
+            <key>CFBundleExecutable</key><string>QcClip</string>
+            <key>CFBundleIdentifier</key><string>com.qcclip.app</string>
+            <key>CFBundleName</key><string>QcClip</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$version</string>
+            <key>CFBundleVersion</key><string>$version</string>
+            <key>CFBundleIconFile</key><string>QcClip.icns</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>LSUIElement</key><true/>
+            <key>NSAppleEventsUsageDescription</key><string>QcClip 需要自动化权限来识别剪贴板来源应用并完成应用过滤。</string>
+            <key>NSAccessibilityUsageDescription</key><string>QcClip 需要辅助功能权限来监听全局快捷键和鼠标操作。</string>
+          </dict></plist>
+          PLIST
+
+          plutil -lint "$contents/Info.plist"
+          codesign --force --deep --sign - "$app_root"
+          codesign --verify --deep --strict "$app_root"
+          hdiutil create \
+            -volname "QcClip-${TARGET}" \
+            -srcfolder "$app_root" \
+            -ov \
+            -format UDZO \
+            "$RUNNER_TEMP/QcClip-${TARGET}.dmg"
+
+      - name: 上传 DMG 到私有仓库 Release
+        env:
+          GH_TOKEN: ${{ secrets.CI_READ_QCCLIP_PRIVATE }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
+          DMG_PATH: ${{ runner.temp }}/QcClip-${{ matrix.target }}.dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "$DMG_PATH" \
+            --repo "$PRIVATE_REPOSITORY" \
+            --clobber
